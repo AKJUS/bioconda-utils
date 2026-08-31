@@ -1,8 +1,9 @@
-from textwrap import dedent
-import tempfile
-import yaml
 import os
+import tempfile
+from pathlib import Path
+from textwrap import dedent
 
+import yaml
 from conda_index.index import update_index
 
 
@@ -95,7 +96,7 @@ class Recipes:
             self.recipes = yaml.safe_load(data)
         else:
             self.data = os.path.join(os.path.dirname(__file__), data)
-            self.recipes = yaml.safe_load(open(self.data))
+            self.recipes = yaml.safe_load(Path(self.data).read_text())
         self.pkgs: dict[str, list[str]] = {}
 
     def write_recipes(self):

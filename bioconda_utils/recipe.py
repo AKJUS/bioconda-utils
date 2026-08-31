@@ -10,39 +10,36 @@ edit the meta.yaml.
 
 from __future__ import annotations
 
-
 import logging
 import os
 import re
 import sys
 import tempfile
 import types
-
 from collections import defaultdict
-from contextlib import redirect_stdout, redirect_stderr
+from collections.abc import Iterator, Sequence
+from contextlib import redirect_stderr, redirect_stdout
 from copy import deepcopy
 from pathlib import Path
+from re import Pattern
 from typing import (
     Any,
+    ClassVar,
+    Literal,
     cast,
     overload,
-    Literal,
 )
-from collections.abc import Sequence
-from re import Pattern
-
 
 import conda_build.api
-
 import jinja2
-
+from conda_build.api import MetaDataTuple
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap
 from ruamel.yaml.constructor import DuplicateKeyError
 
 from . import utils
+from ._types import ALL_PACKAGE_SUBDIRS, PackageSubdir
 from .aiopipe import EndProcessingItem
-
 
 yaml = YAML(typ="rt")  # pylint: disable=invalid-name
 
@@ -62,9 +59,9 @@ class RecipeError(EndProcessingItem):
         if message is not None:
             if line is not None:
                 if column is not None:
-                    message += " (at line %i / column %i)" % (line, column)
+                    message += f" (at line {line:d} / column {column:d})"
                 else:
-                    message += " (at line %i)" % line
+                    message += f" (at line {line:d})"
             super().__init__(item, message)
         else:
             super().__init__(item)
@@ -152,7 +149,7 @@ class Recipe:
     """
 
     #: Variables to pass to Jinja when rendering recipe
-    JINJA_VARS = {
+    JINJA_VARS: ClassVar = {
         "cran_mirror": "https://cloud.r-project.org",
         "compiler": lambda x: f"compiler_{x}",
         "stdlib": lambda x: f"stdlib_{x}",
@@ -162,14 +159,17 @@ class Recipe:
         "cdt": lambda x: x,
     }
 
-    def __init__(self, recipe_dir, recipe_folder):
-        if not recipe_dir.startswith(recipe_folder):
-            raise RuntimeError(f"'{recipe_dir}' not inside '{recipe_folder}'")
+    def __init__(self, recipe_dir: Path, recipe_folder: Path):
+        recipe_path = recipe_dir
+        try:
+            relative_dir = recipe_path.relative_to(recipe_folder)
+        except ValueError as exc:
+            raise RuntimeError(f"'{recipe_path}' not inside '{recipe_folder}'") from exc
 
         #: path to folder containing recipes
-        self.basedir = recipe_folder
+        self.basedir: Path = recipe_folder
         #: relative path to recipe dir from folder containing recipes
-        self.reldir = recipe_dir[len(recipe_folder) :].strip("/")
+        self.reldir = os.fspath(relative_dir)
 
         # Filled in by render()
         #: Parsed recipe YAML
@@ -190,24 +190,24 @@ class Recipe:
         #: For passing data around
         self.data: dict[str, Any] = {}
 
-        # for conda_render() and conda_release()
-        self._conda_meta: Any = None
+        # for conda_render() and conda_render_cleanup()
+        self._conda_meta: list[MetaDataTuple] | None = None
         self._conda_tempdir = None
 
     @property
-    def path(self):
+    def path(self) -> Path:
         """Full path to ``meta.yaml``"""
-        return os.path.join(self.basedir, self.reldir, "meta.yaml")
+        return self.basedir / self.reldir / "meta.yaml"
 
     @property
-    def relpath(self):
+    def relpath(self) -> Path:
         """Relative path to ``meta.yaml`` (from ``basedir``)"""
-        return os.path.join(self.reldir, "meta.yaml")
+        return Path(self.reldir) / "meta.yaml"
 
     @property
-    def dir(self):
+    def dir(self) -> Path:
         """Path to recipe folder"""
-        return os.path.join(self.basedir, self.reldir)
+        return self.basedir / self.reldir
 
     def __str__(self) -> str:
         return self.reldir
@@ -245,25 +245,32 @@ class Recipe:
             try:
                 path = Path(self.dir, script)
                 content = path.read_text()
-            except Exception:
+            except OSError:
+                logger.debug("Unable to read build script %s", script, exc_info=True)
                 continue
             self.build_scripts[script] = content
 
     @classmethod
     @overload
     def from_file(
-        cls, recipe_dir, recipe_fname, return_exceptions: Literal[False] = False
+        cls,
+        recipe_dir: Path,
+        recipe_fname: Path,
+        return_exceptions: Literal[False] = False,
     ) -> Recipe: ...
 
     @classmethod
     @overload
     def from_file(
-        cls, recipe_dir, recipe_fname, return_exceptions: Literal[True]
+        cls,
+        recipe_dir: Path,
+        recipe_fname: Path,
+        return_exceptions: Literal[True],
     ) -> Recipe | Exception: ...
 
     @classmethod
     def from_file(
-        cls, recipe_dir, recipe_fname, return_exceptions=False
+        cls, recipe_dir: Path, recipe_fname: Path, return_exceptions=False
     ) -> Recipe | Exception:
         """Create new `Recipe` object from file
 
@@ -271,11 +278,17 @@ class Recipe:
            recipe_dir: Path to recipes folder
            recipe_fname: Relative path to recipe (folder or meta.yaml)
         """
-        if recipe_fname.endswith("meta.yaml"):
-            recipe_fname = os.path.dirname(recipe_fname)
+        # Recipe paths are loosely typed across the codebase: get_recipes()
+        # yields Path, but load_meta_fast() and helpers pass str. Coerce both
+        # arguments so callers may pass either — the operations below
+        # (.name/.parent/.relative_to) require real Path objects.
+        recipe_dir = Path(recipe_dir)
+        recipe_fname = Path(recipe_fname)
+        if recipe_fname.name == "meta.yaml":
+            recipe_fname = recipe_fname.parent
         recipe = cls(recipe_fname, recipe_dir)
         try:
-            with open(os.path.join(recipe_fname, "meta.yaml")) as text:
+            with open(recipe_fname / "meta.yaml") as text:
                 recipe.load_from_string(text.read())
         except FileNotFoundError:
             exc = MissingMetaYaml(recipe_fname)
@@ -285,19 +298,19 @@ class Recipe:
         except Exception as exc:
             if return_exceptions:
                 return exc
-            raise exc
+            raise
         try:
             recipe.read_conda_build_config()
         except Exception as exc:
             if return_exceptions:
                 return exc
-            raise exc
+            raise
         try:
             recipe.read_build_scripts()
         except Exception as exc:
             if return_exceptions:
                 return exc
-            raise exc
+            raise
         recipe.set_original()
         return recipe
 
@@ -331,8 +344,8 @@ class Recipe:
             if selector:
                 variants[selector.strip("[] ")].append(line)
             else:
-                for variant in variants:
-                    variants[variant].append(line)
+                for variant_lines in variants.values():
+                    variant_lines.append(line)
         else:
             # end of file, need to add one to block height
             block_height += 1
@@ -392,8 +405,7 @@ class Recipe:
         return {
             attr: getattr(template.module, attr)
             for attr in dir(template.module)
-            if not attr.startswith("_")
-            and not hasattr(getattr(template.module, attr), "__call__")
+            if not attr.startswith("_") and not callable(getattr(template.module, attr))
         }
 
     def render(self) -> None:
@@ -442,14 +454,17 @@ class Recipe:
         return []
 
     @property
-    def extra_additional_platforms(self) -> list:
-        """The extra additional-platforms list"""
+    def additional_platforms(self) -> list[PackageSubdir]:
+        """The extra.additional-platforms list normalized to PackageSubdir."""
         if (
             "extra" in self.meta
             and self.meta["extra"]
             and "additional-platforms" in self.meta["extra"]
         ):
-            return list(self.meta["extra"]["additional-platforms"])
+            raw = self.meta["extra"]["additional-platforms"]
+            if isinstance(raw, list):
+                valid = set(ALL_PACKAGE_SUBDIRS)
+                return [PackageSubdir(p) for p in raw if p in valid]
         return []
 
     @property
@@ -589,7 +604,7 @@ class Recipe:
           KeyError if no default given and the path does not exist.
         """
         try:
-            nodes, keys = self._walk(path)
+            nodes, _keys = self._walk(path)
         except (KeyError, TypeError):
             if default is not KeyError:
                 return default
@@ -625,17 +640,17 @@ class Recipe:
             missing_as_empty: boolean whether to include missing sections as
                 empty dictionaries
         """
-        sections = dict()
-        top_level_section = self.get(section, dict())
+        sections = {}
+        top_level_section = self.get(section, {})
         if top_level_section or missing_as_empty:
             sections[section] = top_level_section
-        outputs = self.get("outputs", dict())
+        outputs = self.get("outputs", {})
         if outputs:
             if outputs_exclusive:
-                sections = dict()
+                sections = {}
             for n, o in enumerate(outputs):
                 current_output_path = f"outputs/{n}/{section}"
-                outputs_section = self.get(current_output_path, dict())
+                outputs_section = self.get(current_output_path, {})
                 if outputs_section or missing_as_empty:
                     sections[current_output_path] = outputs_section
         return sections
@@ -676,7 +691,7 @@ class Recipe:
         See `get` for a description of how **path** works.
         """
         # walk path into nodes/keys
-        nodes, keys = self._walk(path, noraise=True)
+        _nodes, keys = self._walk(path, noraise=True)
 
         # "mkdir -p"
         found_path = "/".join(str(key) for key in keys)
@@ -691,7 +706,7 @@ class Recipe:
 
         # get old content
         content = self.get(path)
-        row, col, end_row, end_col = self.get_raw_range(path)
+        row, col, _end_row, _end_col = self.get_raw_range(path)
         self.meta_yaml[row] = self.meta_yaml[row].replace(str(content), str(value))
         if str(value) not in self.meta_yaml[row]:
             self.meta_yaml[row] = self.meta_yaml[row][:col] + value
@@ -733,7 +748,7 @@ class Recipe:
 
         # get lines covered by keys listed in ``within``
         start: int | None = None
-        for key in self.meta.keys():
+        for key in self.meta:
             lineno = self.meta.lc.key(key)[0]
             if key in within:
                 if start is None:
@@ -821,7 +836,7 @@ class Recipe:
         finalize=True,
         permit_unsatisfiable_variants=False,
         **kwargs,
-    ) -> Any:
+    ) -> list[MetaDataTuple]:
         """Handles calling conda_build.api.render
 
         ``conda_build.api.render`` is fragile, loud and slow. Avoid using this
@@ -835,7 +850,7 @@ class Recipe:
 
         Since the ``MetaData`` objects returned expect the on-disk ``meta.yaml``
         to persist (it can get reloaded later on), clients of this function
-        must **make sure to call `conda_release` once you are done** with those
+        must **make sure to call `conda_render_cleanup` once you are done** with those
         objects.
 
         Args:
@@ -869,7 +884,7 @@ class Recipe:
         """
         if self._conda_meta:
             return self._conda_meta
-        self.conda_release()
+        self.conda_render_cleanup()
 
         self._conda_tempdir = tempfile.TemporaryDirectory()
 
@@ -893,15 +908,18 @@ class Recipe:
             cast(Any, sys).exit = new_exit
 
         try:
-            with open("/dev/null", "w") as devnull:
-                with redirect_stdout(devnull), redirect_stderr(devnull):
-                    self._conda_meta = conda_build.api.render(
-                        self._conda_tempdir.name,
-                        finalize=finalize,
-                        bypass_env_check=bypass_env_check,
-                        permit_unsatisfiable_variants=permit_unsatisfiable_variants,
-                        **kwargs,
-                    )
+            with (
+                open(os.devnull, "w") as devnull,
+                redirect_stdout(devnull),
+                redirect_stderr(devnull),
+            ):
+                self._conda_meta = conda_build.api.render(
+                    self._conda_tempdir.name,
+                    finalize=finalize,
+                    bypass_env_check=bypass_env_check,
+                    permit_unsatisfiable_variants=permit_unsatisfiable_variants,
+                    **kwargs,
+                )
         except RuntimeError as exc:
             if exc.args[0].startswith("Couldn't extract raw recipe text"):
                 line = self.meta_yaml[0]
@@ -923,7 +941,7 @@ class Recipe:
             cast(Any, sys).exit = old_exit
         return self._conda_meta
 
-    def conda_release(self):
+    def conda_render_cleanup(self):
         """Releases resources acquired in `conda_render`"""
         if self._conda_meta:
             self._conda_meta = None
@@ -932,8 +950,10 @@ class Recipe:
             self._conda_tempdir = None
 
 
-def load_parallel_iter(recipe_folder, packages):
-    recipes = list(utils.get_recipes(recipe_folder, packages))
+def load_parallel_iter(
+    recipe_folder: Path, package_patterns: Sequence[str]
+) -> Iterator[Recipe]:
+    recipes = list(utils.get_recipes(recipe_folder, package_patterns))
     for recipe in utils.parallel_iter(
         Recipe.from_file,
         recipes,

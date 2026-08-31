@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-
 """
 To ensure conda packages are built in the most compatible manner, we can use
 a docker container. This module supports using a docker container to build
@@ -44,26 +42,61 @@ Other notes:
   Most magic happens here.
 """
 
+import grp
+import logging
 import os
 import os.path
-from shlex import quote
+import pwd
+import re
 import shutil
 import subprocess as sp
 import tempfile
-import pwd
-import grp
-from importlib.resources import files, as_file
-import re
-from packaging.version import Version
+from importlib.resources import as_file, files
+from pathlib import Path
+from shlex import quote
 from typing import Protocol
 
-from conda import exports as conda_exports
+from packaging.version import Version
 
 from . import utils
-
-import logging
+from ._types import (
+    ALL_PACKAGE_SUBDIRS,
+    ContainerPlatform,
+    PkgBuildRef,
+    Subdir,
+    container_platform_to_package_subdir,
+    local_mulled_image_ref,
+    native_container_platform,
+)
 
 logger = logging.getLogger(__name__)
+
+LOCAL_CHANNEL_SUBDIRS = tuple(
+    subdir for subdir in ALL_PACKAGE_SUBDIRS if subdir.startswith("linux-")
+) + ("noarch",)
+LOCAL_CHANNEL_MKDIRS = "\n  ".join(
+    f'mkdir -p "${{local_channel}}"/{subdir}' for subdir in LOCAL_CHANNEL_SUBDIRS
+)
+LOCAL_CHANNEL_SUBDIR_ARGS = " ".join(quote(subdir) for subdir in LOCAL_CHANNEL_SUBDIRS)
+
+
+PUBLISH_BUILT_PACKAGES_TEMPLATE = r"""
+# Publish only packages produced by this successful conda-build invocation.
+# conda-build chooses each output's channel subdirectory, which matters for
+# recipes that mix architecture-specific and noarch outputs.
+for subdir in {local_channel_subdirs}; do
+  output_subdir="${{build_output}}/${{subdir}}"
+  test -d "${{output_subdir}}" || continue
+  while IFS= read -r -d '' package; do
+    destination='{self.container_staging}'/"${{subdir}}/${{package##*/}}"
+    cp -- "${{package}}" "${{destination}}"
+    chown {self.user_info[uid]}:{self.user_info[gid]} "${{destination}}"
+  done < <(
+    find "${{output_subdir}}" -maxdepth 1 -type f \
+      \( -name '*.tar.bz2' -o -name '*.conda' \) -print0
+  )
+done
+"""
 
 
 class CondaBuildConfigFile(Protocol):
@@ -93,13 +126,11 @@ set -eo pipefail
 #
 # Note that if the directory didn't exist on the host, then the staging area
 # will exist in the container but will be empty.  Channels expect at least
-# a linux-64/linux-aarch64 and noarch directory within that directory, so we
-# make sure it exists before adding the channel.
+# Linux and noarch channel subdirectories within that directory, so we make
+# sure they exist before adding the channel.
 # Also ensure conda-build's local channel directory exists the same way.
 for local_channel in '/opt/conda/conda-bld' '{self.container_staging}'; do
-  mkdir -p "${{local_channel}}"/linux-64
-  mkdir -p "${{local_channel}}"/linux-aarch64
-  mkdir -p "${{local_channel}}"/noarch
+  {local_channel_mkdirs}
   conda index "${{local_channel}}"
 done
 conda config --add channels file://{self.container_staging} 2> >(
@@ -109,23 +140,20 @@ conda config --add channels file://{self.container_staging} 2> >(
 # Pass on conda_pkg_format ("2" for .conda instead of .tar.bz2) from host's conda-build config.
 #test -n '{self.conda_pkg_format}' && conda config --set conda_build.pkg_format '{self.conda_pkg_format}'
 
+# Build into a clean, container-local output channel. Keeping this separate
+# from the mounted staging channel ensures that a failed multi-output build
+# cannot publish only some of its packages to the host.
+build_output=$(mktemp -d /opt/conda/bioconda-output.XXXXXX)
+
 # The actual building...
 # we explicitly point to the meta.yaml, in order to keep
 # conda-build from building all subdirectories
-conda-build -c file://{self.container_staging} {self.conda_build_args} {self.container_recipe}/meta.yaml 2>&1
+conda-build -c file://{self.container_staging} {self.conda_build_args} \
+  --output-folder "${{build_output}}" {self.container_recipe}/meta.yaml 2>&1
 
-# copy all built packages to the staging area
-find /opt/conda/conda-bld \
-  -name src_cache -prune -o \
-  -type f \( -name '*.tar.bz2' -o -name '*.conda' \) -print0 |
-  xargs -0 -- cp -t '{self.container_staging}/{arch}' --
-#While technically better, this is slower and more prone to breaking
-#cp `conda-build {self.conda_build_args} {self.container_recipe}/meta.yaml --output | grep -e '\.tar\.bz2$' -e '\.conda$')` {self.container_staging}/{arch}
+{publish_built_packages}
 conda index {self.container_staging}
-# Ensure permissions are correct on the host.
-HOST_USER={self.user_info[uid]}
-chown $HOST_USER:$HOST_USER {self.container_staging}/{arch}/*
-"""  # noqa: E501,E122: line too long, continuation line missing indentation or outdented
+"""
 
 # ----------------------------------------------------------------------------
 # DOCKERFILE_TEMPLATE
@@ -167,6 +195,7 @@ class RecipeBuilder:
         build_image: bool = False,
         image_build_dir: str | None = None,
         docker_base_image: str | None = None,
+        target_platform: ContainerPlatform | None = None,
     ) -> None:
         """
         Class to handle building a custom docker container that can be used for
@@ -251,6 +280,7 @@ class RecipeBuilder:
         """
         self.requirements = requirements
         self.conda_build_args = ""
+        self.target_platform: ContainerPlatform | None = target_platform
         self.build_script_template: str = build_script_template
         self.dockerfile_template = dockerfile_template
         self.keep_image = keep_image
@@ -259,15 +289,18 @@ class RecipeBuilder:
         self.docker_base_image = docker_base_image
         self.docker_temp_image = tag
 
+        if not self.build_image:
+            self._ensure_base_image()
+
         # find and store user info
         uid = os.getuid()
         usr = pwd.getpwuid(uid)
-        self.user_info = dict(
-            uid=uid,
-            gid=usr.pw_gid,
-            groupname=grp.getgrgid(usr.pw_gid).gr_name,
-            username=usr.pw_name,
-        )
+        self.user_info = {
+            "uid": uid,
+            "gid": usr.pw_gid,
+            "groupname": grp.getgrgid(usr.pw_gid).gr_name,
+            "username": usr.pw_name,
+        }
 
         self.container_recipe = container_recipe
         self.container_staging = container_staging
@@ -298,12 +331,56 @@ class RecipeBuilder:
         if self.build_image:
             self._build_image()
 
+    def _ensure_base_image(self) -> None:
+        """Ensure the requested build image and platform are available locally."""
+        image = self.docker_base_image
+        if image is None:
+            raise ValueError("docker_base_image is required when build_image is false")
+
+        result = sp.run(
+            [
+                "docker",
+                "image",
+                "inspect",
+                "--format",
+                "{{.Os}}/{{.Architecture}}",
+                image,
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if result.returncode == 0 and (
+            self.target_platform is None
+            or result.stdout.strip() == self.target_platform
+        ):
+            return
+
+        logger.info("Pulling Docker build image %s", image)
+        command = ["docker", "pull"]
+        if self.target_platform is not None:
+            command += ["--platform", self.target_platform]
+        command.append(image)
+        utils.run(command, live=True)
+
     def _get_config_path(
         self, staging_prefix: str, i: int, config_file: CondaBuildConfigFile
     ) -> str:
         src_basename = os.path.basename(config_file.path)
         dst_basename = f"conda_build_config_{i}_{config_file.arg}_{src_basename}"
         return os.path.join(staging_prefix, dst_basename)
+
+    def _output_subdir(self, noarch: bool) -> Subdir:
+        """Return the legacy ``{arch}`` template value for this build.
+
+        The default build script preserves the subdirectory selected by
+        conda-build for every output. Custom templates may still use
+        ``{arch}``, so keep it accurate for cross-platform builds.
+        """
+        if noarch:
+            return "noarch"
+        target_platform = self.target_platform or native_container_platform()
+        return container_platform_to_package_subdir(target_platform)
 
     def __del__(self) -> None:
         self.cleanup()
@@ -341,14 +418,16 @@ class RecipeBuilder:
         )
         with open(os.path.join(build_dir, "requirements.txt"), "w") as fout:
             if self.requirements:
-                fout.write(open(self.requirements).read())
+                fout.write(Path(self.requirements).read_text())
             else:
                 # pkg_resources (deprecated) is replaced with importlib.resources
-                with as_file(
-                    files("bioconda_utils") / "bioconda_utils-requirements.txt"
-                ) as req_path:
-                    with open(req_path, encoding="utf-8") as fh:
-                        fout.write(fh.read())
+                with (
+                    as_file(
+                        files("bioconda_utils") / "bioconda_utils-requirements.txt"
+                    ) as req_path,
+                    open(req_path, encoding="utf-8") as fh,
+                ):
+                    fout.write(fh.read())
 
         proxies = "\n".join(f"ENV {k} {v}" for k, v in self._find_proxy_settings())
 
@@ -359,7 +438,7 @@ class RecipeBuilder:
                 )
             )
 
-        logger.debug("Dockerfile:\n" + open(fout.name).read())
+        logger.debug("Dockerfile:\n%s", Path(fout.name).read_text())
 
         # Check if the installed version of docker supports the --network flag
         # (requires version >= 1.13.0)
@@ -398,16 +477,18 @@ class RecipeBuilder:
         else:
             # Network flag was added in 1.13.0, do not add it for lower versions. xref #5387
             cmd = ["docker", "build", "-t", self.docker_temp_image, build_dir]
+        if self.target_platform:
+            cmd[2:2] = ["--platform", self.target_platform]
 
         try:
             with utils.Progress():
-                p = utils.run(cmd, mask=False)
-        except sp.CalledProcessError as e:
+                p = utils.run(cmd)
+        except sp.CalledProcessError:
             logger.error(
                 "DOCKER FAILED: Error building docker container %s. ",
                 self.docker_temp_image,
             )
-            raise e
+            raise
 
         logger.info("DOCKER: Built docker image tag=%s", self.docker_temp_image)
         if self.image_build_dir is None:
@@ -439,7 +520,9 @@ class RecipeBuilder:
             Environmental variables
 
         noarch: bool
-            Has to be set to true if this is a noarch build
+            Whether to expose ``noarch`` through the legacy ``{arch}``
+            custom-template placeholder. The default template preserves the
+            subdirectory conda-build selects independently for every output.
 
         Note that the binds are set up automatically to match the expectations
         of the build script, and will use the currently-configured
@@ -449,7 +532,7 @@ class RecipeBuilder:
         # Attach the build args to self so that it can be filled in by the
         # template.
         if not isinstance(build_args, str):
-            raise ValueError("build_args must be str")
+            raise TypeError("build_args must be str")
         build_args_list = [build_args]
         for i, config_file in enumerate(utils.get_conda_build_config_files()):
             dst_file = self._get_config_path(self.container_staging, i, config_file)
@@ -458,14 +541,26 @@ class RecipeBuilder:
 
         # Write build script to tempfile
         build_dir = os.path.realpath(tempfile.mkdtemp())
-        # conda_exports.subdir is {platform}-{arch} like: 'linux-64' 'linux-aarch64'
+        publish_built_packages = PUBLISH_BUILT_PACKAGES_TEMPLATE.format_map(
+            {
+                "self": self,
+                "local_channel_subdirs": LOCAL_CHANNEL_SUBDIR_ARGS,
+            }
+        )
         script = self.build_script_template.format_map(
-            {"self": self, "arch": "noarch" if noarch else conda_exports.subdir}
+            {
+                "self": self,
+                "arch": self._output_subdir(noarch),
+                "local_channel_mkdirs": LOCAL_CHANNEL_MKDIRS,
+                "publish_built_packages": publish_built_packages,
+            }
         )
         with open(os.path.join(build_dir, "build_script.bash"), "w") as fout:
             fout.write(script)
         build_script = fout.name
-        logger.debug("DOCKER: Container build script: \n%s", open(fout.name).read())
+        logger.debug(
+            "DOCKER: Container build script: \n%s", Path(fout.name).read_text()
+        )
 
         # Build the args for env vars. Note can also write these to tempfile
         # and use --env-file arg, but using -e seems clearer in debug output.
@@ -484,6 +579,10 @@ class RecipeBuilder:
             "--net",
             "host",
             "--rm",
+        ]
+        if self.target_platform:
+            cmd += ["--platform", self.target_platform]
+        cmd += [
             "-v",
             f"{build_script}:/opt/build_script.bash",
             "-v",
@@ -500,25 +599,31 @@ class RecipeBuilder:
 
         logger.debug("DOCKER: cmd: %s", cmd)
         with utils.Progress():
-            p = utils.run(cmd, mask=False, live=live_logs)
+            p = utils.run(cmd, live=live_logs)
         return p
 
     def cleanup(self) -> None:
         if self.build_image and not self.keep_image:
             cmd = ["docker", "rmi", self.docker_temp_image]
-            utils.run(cmd, mask=False)
+            utils.run(cmd)
 
 
-def purgeImage(mulled_upload_target: str, img: str) -> None:
-    pkg_name_and_version, pkg_build_string = img.rsplit("--", 1)
-    pkg_name, pkg_version = pkg_name_and_version.rsplit("=", 1)
-    pkg_container_image = (
-        f"quay.io/{mulled_upload_target}/{pkg_name}:{pkg_version}--{pkg_build_string}"
-    )
-    cmd = ["docker", "rmi", pkg_container_image]
-    utils.run(cmd, mask=False)
+def purgeImage(
+    img: PkgBuildRef,
+    target_platform: ContainerPlatform | None = None,
+) -> None:
+    """Remove the local mulled image ``mulled-build`` produced for *img*.
+
+    The local image is tagged under the canonical ``biocontainers`` namespace
+    by ``pkg_test.build_and_test_mulled_image`` (not the upload target), so the
+    ref is derived via :func:`local_mulled_image_ref` -- the same source
+    :func:`bioconda_utils.upload.mulled_upload` reads from when copying to the
+    registry.
+    """
+    cmd = ["docker", "rmi", local_mulled_image_ref(img, target_platform)]
+    utils.run(cmd)
 
 
 def pruneStoppedContainers() -> None:
     cmd = ["docker", "container", "prune", "-f"]
-    utils.run(cmd, mask=False)
+    utils.run(cmd)

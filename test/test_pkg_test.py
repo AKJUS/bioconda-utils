@@ -1,13 +1,12 @@
-import sys
-from textwrap import dedent
 import subprocess as sp
+import sys
+from pathlib import Path
+from textwrap import dedent
 
 import pytest
-
 from helpers import Recipes, ensure_missing
-from bioconda_utils import pkg_test
-from bioconda_utils import utils
-from bioconda_utils import build
+
+from bioconda_utils import build, pkg_test, utils
 
 # TODO:
 # need tests for channel order and extra channels (see
@@ -43,12 +42,13 @@ one:
 """)
 
 
+# Skip mulled_build_and_test on default since these tests call mulled-build directly.
 @pytest.fixture
 def build_pkg(request):
     """Build test packages and remove every registered output afterward."""
     registered_packages = set()
 
-    def _build_pkg(recipe, mulled_test=False, docker_builder=None):
+    def _build_pkg(recipe, mulled_build_and_test=False, docker_builder=None):
         r = Recipes(recipe, from_string=True)
         r.write_recipes()
         recipe_dir = r.recipe_dirs["one"]
@@ -57,9 +57,9 @@ def build_pkg(request):
         for pkg in built_packages:
             ensure_missing(pkg)
         build.build(
-            recipe=recipe_dir,
+            recipe=Path(recipe_dir),
             pkg_paths=built_packages,
-            mulled_test=mulled_test,
+            mulled_build_and_test=mulled_build_and_test,
             docker_builder=docker_builder,
         )
         return built_packages
@@ -79,7 +79,7 @@ def test_pkg_test(build_pkg):
     """
     built_packages = build_pkg(RECIPE_ONE)
     for pkg in built_packages:
-        pkg_test.test_package(pkg)
+        pkg_test.build_and_test_mulled_image(pkg)
 
 
 @pytest.mark.skipif(SKIP_OSX, reason="skipping on osx")
@@ -90,7 +90,7 @@ def test_pkg_test_mulled_build_error(build_pkg):
     built_packages = build_pkg(RECIPE_ONE)
     with pytest.raises(sp.CalledProcessError):
         for pkg in built_packages:
-            pkg_test.test_package(pkg, mulled_args="--wrong-arg")
+            pkg_test.build_and_test_mulled_image(pkg, mulled_args="--wrong-arg")
 
 
 @pytest.mark.skipif(SKIP_OSX, reason="skipping on osx")
@@ -100,4 +100,16 @@ def test_pkg_test_custom_base_image(build_pkg):
     """
     built_packages = build_pkg(RECIPE_CUSTOM_BASE)
     for pkg in built_packages:
-        pkg_test.test_package(pkg, base_image="debian:latest")
+        pkg_test.build_and_test_mulled_image(pkg, base_image="debian:latest")
+
+
+@pytest.mark.skipif(SKIP_OSX, reason="skipping on osx")
+def test_pkg_test_temporary_container(build_pkg):
+    """
+    Running a test in a temporary container with pre-solved spec.
+    """
+    built_packages = build_pkg(RECIPE_ONE)
+    for pkg in built_packages:
+        res = pkg_test.test_package_in_temporary_container(pkg)
+        assert res is not None
+        assert res.returncode == 0
