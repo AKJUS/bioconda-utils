@@ -1,7 +1,7 @@
 """Shared helpers for asynchronous HTTP access
 
 This module centralizes the pieces shared between the async download
-helpers in :py:mod:`bioconda_utils.utils` and
+helpers in :py:mod:`bioconda_utils.conda.repodata` and
 :py:mod:`bioconda_utils.aiopipe`: the user agent we identify ourselves
 with, the retry policy applied to transient HTTP errors and the progress
 monitor used while streaming response bodies.
@@ -9,11 +9,12 @@ monitor used while streaming response bodies.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
-from typing import Any
+from collections.abc import AsyncIterator
 
 import aiohttp
 import backoff
+
+from .logsetup import tqdm
 
 # Used as user agent in http requests and as requester in github API requests
 USER_AGENT = "bioconda/bioconda-utils"
@@ -61,8 +62,6 @@ def make_session(
 async def stream_download(
     resp: aiohttp.ClientResponse,
     desc: str,
-    *,
-    progress_factory: Callable[..., Any],
     block_size: int = 1024 * 1024,
     leave: bool = True,
     disable: bool | None = None,
@@ -72,13 +71,12 @@ async def stream_download(
     Args:
       resp: Response to read from
       desc: Progress monitor label
-      progress_factory: Callable returning a progress-monitor context manager
       block_size: Size of the blocks yielded
       leave: Keep the progress monitor visible after completion
       disable: Disable the progress monitor
     """
     size = int(resp.headers.get("Content-Length", 0))
-    with progress_factory(
+    with tqdm(
         total=size,
         unit="B",
         unit_scale=True,

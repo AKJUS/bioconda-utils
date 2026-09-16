@@ -4,9 +4,9 @@ from typing import cast
 
 import aiohttp
 
-from bioconda_utils import http, utils
 from bioconda_utils.aiopipe import AsyncRequests as PipelineRequests
-from bioconda_utils.utils import AsyncRequests as UtilityRequests
+from bioconda_utils.conda.repodata import AsyncRequests as RepodataRequests
+from bioconda_utils.support import http, logsetup
 
 
 def test_make_session_uses_requested_user_agent():
@@ -29,9 +29,9 @@ def test_pipeline_requests_preserves_user_agent_override():
     asyncio.run(check())
 
 
-def test_utility_requests_preserves_user_agent_override(monkeypatch):
-    class CustomRequests(UtilityRequests):
-        USER_AGENT = "custom-utility-agent"
+def test_repodata_requests_preserves_user_agent_override(monkeypatch):
+    class CustomRequests(RepodataRequests):
+        USER_AGENT = "custom-repodata-agent"
 
     original_make_session = http.make_session
     observed_user_agents = []
@@ -46,7 +46,7 @@ def test_utility_requests_preserves_user_agent_override(monkeypatch):
     assert observed_user_agents == [CustomRequests.USER_AGENT]
 
 
-def test_stream_download_yields_blocks_and_reports_progress():
+def test_stream_download_yields_blocks_and_reports_progress(monkeypatch):
     class Content:
         def __init__(self):
             self.blocks = [b"first", b"second", b""]
@@ -81,6 +81,7 @@ def test_stream_download_yields_blocks_and_reports_progress():
         progress_options.update(kwargs)
         return progress
 
+    monkeypatch.setattr(http, "tqdm", progress_factory)
     response = Response()
 
     async def download():
@@ -89,7 +90,6 @@ def test_stream_download_yields_blocks_and_reports_progress():
             async for block in http.stream_download(
                 cast(aiohttp.ClientResponse, response),
                 "artifact",
-                progress_factory=progress_factory,
                 block_size=4,
                 leave=False,
                 disable=True,
@@ -135,11 +135,11 @@ def test_tqdm_explicit_disable_is_respected(monkeypatch):
         options.update(kwargs)
         return object()
 
-    monkeypatch.setattr(utils.sys, "stderr", Terminal())
-    monkeypatch.setattr(utils._tqdm, "tqdm", make_progress)
+    monkeypatch.setattr(logsetup.sys, "stderr", Terminal())
+    monkeypatch.setattr(logsetup._tqdm, "tqdm", make_progress)
     for name in ("TERM", "CI", "CIRCLECI"):
         monkeypatch.delenv(name, raising=False)
 
-    utils.tqdm(disable=True, logger=test_logger)
+    logsetup.tqdm(disable=True, logger=test_logger)
 
     assert options["disable"] is True

@@ -27,8 +27,9 @@ import aioftp
 import aiohttp
 from typing_extensions import Self
 
-from . import http
-from .utils import threads_to_use, tqdm
+from .support import http
+from .support.logsetup import tqdm
+from .support.parallel import threads_to_use
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
@@ -330,12 +331,7 @@ class AsyncRequests:
         assert self.session is not None
         async with self.session.get(url) as resp:
             resp.raise_for_status()
-            async for block in http.stream_download(
-                resp,
-                desc,
-                progress_factory=tqdm,
-                leave=False,
-            ):
+            async for block in http.stream_download(resp, desc, leave=False):
                 checksum.update(block)
         return checksum.hexdigest()
 
@@ -349,12 +345,7 @@ class AsyncRequests:
         async with self.session.get(url) as resp:
             resp.raise_for_status()
             async with aiofiles.open(fname, "wb") as out:
-                async for block in http.stream_download(
-                    resp,
-                    desc,
-                    progress_factory=tqdm,
-                    leave=False,
-                ):
+                async for block in http.stream_download(resp, desc, leave=False):
                     await out.write(block)
 
     async def get_ftp_listing(self, url):
